@@ -32,12 +32,25 @@ apt-get install -y \
     openjdk-17-jdk \
     postgresql \
     postgresql-contrib \
+    postgresql-contrib-* \
     maven \
     ant \
     git \
     curl \
     wget \
     unzip
+
+echo "=== Setting JAVA_HOME ==="
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+export PATH=$JAVA_HOME/bin:$PATH
+
+# Make JAVA_HOME persistent
+echo "export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> /etc/environment
+echo "export PATH=\$JAVA_HOME/bin:\$PATH" >> /etc/environment
+
+# Set for dspace user
+sudo -u "$DSPACE_USER" bash -c 'echo "export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> ~/.bashrc'
+sudo -u "$DSPACE_USER" bash -c 'echo "export PATH=\$JAVA_HOME/bin:\$PATH" >> ~/.bashrc'
 
 echo "=== Installing Node.js and Yarn for frontend ==="
 curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
@@ -59,6 +72,11 @@ CREATE USER $DB_USER WITH PASSWORD '$DB_PASS';
 CREATE DATABASE $DB_NAME WITH OWNER $DB_USER ENCODING 'UTF8';
 GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO $DB_USER;
 ALTER USER $DB_USER WITH SUPERUSER;
+EOF
+
+echo "=== Enabling pgcrypto extension ==="
+sudo -u postgres psql -d "$DB_NAME" <<EOF
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
 EOF
 
 # Enable password authentication
@@ -110,6 +128,8 @@ solr.server = http://localhost:8983/solr
 EOF
 
 echo "=== Building DSpace backend ==="
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+export PATH=$JAVA_HOME/bin:$PATH
 mvn clean package -Dmicrometer.enabled=false
 
 echo "=== Installing DSpace backend ==="
