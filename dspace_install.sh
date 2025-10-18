@@ -1,18 +1,21 @@
 #!/bin/bash
 
-# DSpace 8.x Installation Script
-# Backend API on port 8080, Frontend UI on port 4000
+# DSpace 9.x Installation Script (Following Official Documentation)
+# Based on: https://wiki.lyrasis.org/display/DSDOC9x/Installing+DSpace
 
 set -e
 
 # Configuration variables
-DSPACE_VERSION="8.0"
+DSPACE_VERSION="9.1"
 DSPACE_USER="dspace"
 DSPACE_DIR="/dspace"
-DSPACE_SRC="/opt/dspace-src"
+DSPACE_SRC="/opt/dspace-source"
+DSPACE_UI="/opt/dspace-angular"
 DB_NAME="dspace"
 DB_USER="dspace"
 DB_PASS="dspace_password_change_me"
+SOLR_DIR="/opt/solr"
+SOLR_VERSION="9.8.0"
 
 # Check if running as root
 if [ "$EUID" -ne 0 ]; then 
@@ -20,19 +23,24 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-echo "=== DSpace ${DSPACE_VERSION} Installation ==="
+echo "=== DSpace ${DSPACE_VERSION} Installation Script ==="
 echo ""
 
-echo "=== Updating system ==="
+# ==========================================
+# BACKEND INSTALLATION
+# ==========================================
+
+echo "=== STEP 1: Installing Backend Prerequisites ==="
+
+echo "Updating system packages..."
 apt-get update
 apt-get upgrade -y
 
-echo "=== Installing dependencies ==="
+echo "Installing Java 17, PostgreSQL, Maven, Ant, Git..."
 apt-get install -y \
     openjdk-17-jdk \
     postgresql \
     postgresql-contrib \
-    postgresql-contrib-* \
     maven \
     ant \
     git \
@@ -40,7 +48,7 @@ apt-get install -y \
     wget \
     unzip
 
-echo "=== Setting JAVA_HOME ==="
+echo "=== STEP 2: Setting up Java Environment ==="
 export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 export PATH=$JAVA_HOME/bin:$PATH
 
@@ -48,167 +56,202 @@ export PATH=$JAVA_HOME/bin:$PATH
 echo "export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> /etc/environment
 echo "export PATH=\$JAVA_HOME/bin:\$PATH" >> /etc/environment
 
-# Set for dspace user
-sudo -u "$DSPACE_USER" bash -c 'echo "export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> ~/.bashrc'
-sudo -u "$DSPACE_USER" bash -c 'echo "export PATH=\$JAVA_HOME/bin:\$PATH" >> ~/.bashrc'
+echo "Java version:"
+java -version
 
-echo "=== Installing Node.js and Yarn for frontend ==="
-curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
-apt-get install -y nodejs
-npm install -g yarn
-
-echo "=== Creating DSpace user ==="
+echo "=== STEP 3: Creating DSpace System User ==="
 if ! id "$DSPACE_USER" &>/dev/null; then
     useradd -m -s /bin/bash "$DSPACE_USER"
+    echo "export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> /home/$DSPACE_USER/.bashrc
+    echo "export PATH=\$JAVA_HOME/bin:\$PATH" >> /home/$DSPACE_USER/.bashrc
     echo "Created user: $DSPACE_USER"
 else
     echo "User $DSPACE_USER already exists"
 fi
 
-echo "=== Configuring PostgreSQL ==="
-sudo -u postgres psql -c "SELECT 1 FROM pg_database WHERE datname = '$DB_NAME'" | grep -q 1 || \
+echo "=== STEP 4: Setting up PostgreSQL Database ==="
+
+# Create database user
+sudo -u postgres psql -c "SELECT 1 FROM pg_user WHERE usename = '$DB_USER'" | grep -q 1 || \
 sudo -u postgres psql <<EOF
-CREATE USER $DB_USER WITH PASSWORD '$DB_PASS';
-CREATE DATABASE $DB_NAME WITH OWNER $DB_USER ENCODING 'UTF8';
-GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO $DB_USER;
-ALTER USER $DB_USER WITH SUPERUSER;
+CREATE USER $DB_USER WITH PASSWORD '$DB_PASS' NOSUPERUSER;
 EOF
 
-echo "=== Enabling pgcrypto extension ==="
+# Create database
+sudo -u postgres psql -c "SELECT 1 FROM pg_database WHERE datname = '$DB_NAME'" | grep -q 1 || \
+sudo -u postgres psql <<EOF
+CREATE DATABASE $DB_NAME WITH OWNER $DB_USER ENCODING 'UTF8';
+GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO $DB_USER;
+EOF
+
+# Enable pgcrypto extension
 sudo -u postgres psql -d "$DB_NAME" <<EOF
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 EOF
 
-# Enable password authentication
-PG_HBA="/etc/postgresql/*/main/pg_hba.conf"
-if ! grep -q "dspace" $PG_HBA 2>/dev/null; then
-    echo "local   $DB_NAME   $DB_USER   md5" | tee -a $(ls $PG_HBA)
+# Configure PostgreSQL for TCP/IP connections
+PG_VERSION=$(sudo -u postgres psql -t -c "SELECT version()" | grep -oP '(?<=PostgreSQL )\d+')
+PG_HBA="/etc/postgresql/$PG_VERSION/main/pg_hba.conf"
+PG_CONF="/etc/postgresql/$PG_VERSION/main/postgresql.conf"
+
+# Enable listen on localhost
+if ! grep -q "^listen_addresses = 'localhost'" "$PG_CONF"; then
+    sed -i "s/#listen_addresses = 'localhost'/listen_addresses = 'localhost'/" "$PG_CONF"
 fi
+
+# Add MD5 authentication for dspace database
+if ! grep -q "host.*$DB_NAME.*$DB_USER" "$PG_HBA"; then
+    sed -i "/^# TYPE.*DATABASE.*USER.*ADDRESS.*METHOD/a host    $DB_NAME    $DB_USER    127.0.0.1/32    md5" "$PG_HBA"
+fi
+
 systemctl restart postgresql
 
-echo "=== Downloading DSpace source ==="
+echo "Testing database connection..."
+PGPASSWORD=$DB_PASS psql -h localhost -U $DB_USER -d $DB_NAME -c "SELECT version();" || {
+    echo "ERROR: Database connection failed!"
+    exit 1
+}
+
+echo "=== STEP 5: Installing Apache Solr ==="
+cd /opt
+
+if [ ! -d "$SOLR_DIR" ]; then
+    echo "Downloading Solr ${SOLR_VERSION}..."
+    wget "https://archive.apache.org/dist/solr/solr/${SOLR_VERSION}/solr-${SOLR_VERSION}.tgz"
+    tar xzf "solr-${SOLR_VERSION}.tgz"
+    mv "solr-${SOLR_VERSION}" "$SOLR_DIR"
+    rm "solr-${SOLR_VERSION}.tgz"
+    
+    # Create solr user if needed
+    if ! id "solr" &>/dev/null; then
+        useradd -r -s /bin/bash solr
+    fi
+    
+    chown -R solr:solr "$SOLR_DIR"
+else
+    echo "Solr already exists at $SOLR_DIR"
+fi
+
+echo "=== STEP 6: Downloading DSpace Backend Source Code ==="
 mkdir -p "$DSPACE_SRC"
 cd /opt
 
 if [ ! -d "$DSPACE_SRC/.git" ]; then
+    echo "Cloning DSpace repository..."
     git clone https://github.com/DSpace/DSpace.git "$DSPACE_SRC"
     cd "$DSPACE_SRC"
     git checkout "dspace-${DSPACE_VERSION}"
 else
-    echo "DSpace source already exists"
+    echo "DSpace source already exists at $DSPACE_SRC"
     cd "$DSPACE_SRC"
 fi
 
-echo "=== Configuring DSpace ==="
+chown -R "$DSPACE_USER":"$DSPACE_USER" "$DSPACE_SRC"
+
+echo "=== STEP 7: Configuring DSpace (local.cfg) ==="
 cd "$DSPACE_SRC"
 
-# Create local.cfg with basic configuration
+# Create local.cfg based on the official example
 cat > "$DSPACE_SRC/local.cfg" <<EOF
-# DSpace installation directory
+# DSpace Installation Directory
 dspace.dir = $DSPACE_DIR
 
-# Database configuration
-db.url = jdbc:postgresql://localhost:5432/$DB_NAME
-db.username = $DB_USER
-db.password = $DB_PASS
-
-# Server configuration
+# DSpace Hostname and URLs
+dspace.hostname = localhost
 dspace.server.url = http://localhost:8080/server
 dspace.ui.url = http://localhost:4000
 
-# Admin email
-mail.admin = admin@yourdomain.edu
+# Database Configuration
+db.url = jdbc:postgresql://localhost:5432/$DB_NAME
+db.username = $DB_USER
+db.password = $DB_PASS
+db.dialect = org.hibernate.dialect.PostgreSQLDialect
+db.driver = org.postgresql.Driver
+db.maxconnections = 30
+db.maxwait = 5000
+db.maxidle = -1
+db.statementpool = true
 
-# Basic mail server (configure properly for production)
-mail.server = localhost
-mail.from.address = noreply@yourdomain.edu
-
-# Solr configuration
+# Solr Configuration  
 solr.server = http://localhost:8983/solr
+
+# Email Configuration (update for production!)
+mail.server = localhost
+mail.from.address = dspace-noreply@localhost
+mail.admin = admin@localhost
+
+# Default Language
+default.language = en
+
+# Handle prefix (use your own in production!)
+handle.prefix = 123456789
 EOF
 
-echo "=== Building DSpace backend ==="
+echo "=== STEP 8: Creating DSpace Installation Directory ==="
+mkdir -p "$DSPACE_DIR"
+chown "$DSPACE_USER":"$DSPACE_USER" "$DSPACE_DIR"
+
+echo "=== STEP 9: Building DSpace Backend ==="
+cd "$DSPACE_SRC"
 export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 export PATH=$JAVA_HOME/bin:$PATH
-mvn clean package -Dmicrometer.enabled=false
 
-echo "=== Installing DSpace backend ==="
-mkdir -p "$DSPACE_DIR"
+echo "This may take 10-20 minutes..."
+sudo -u "$DSPACE_USER" bash -c "cd $DSPACE_SRC && export JAVA_HOME=$JAVA_HOME && export PATH=$JAVA_HOME/bin:\$PATH && mvn -U clean package"
+
+echo "=== STEP 10: Installing DSpace Backend ==="
 cd "$DSPACE_SRC/dspace/target/dspace-installer"
-ant fresh_install
+sudo -u "$DSPACE_USER" bash -c "cd $DSPACE_SRC/dspace/target/dspace-installer && ant fresh_install"
 
-echo "=== Setting permissions ==="
-chown -R "$DSPACE_USER":"$DSPACE_USER" "$DSPACE_DIR"
-chown -R "$DSPACE_USER":"$DSPACE_USER" "$DSPACE_SRC"
+echo "=== STEP 11: Initializing Database ==="
+sudo -u "$DSPACE_USER" "$DSPACE_DIR/bin/dspace" database migrate
 
-echo "=== Creating DSpace admin user ==="
-sudo -u "$DSPACE_USER" "$DSPACE_DIR/bin/dspace" create-administrator \
-    -e admin@yourdomain.edu \
-    -f DSpace -l Administrator \
-    -p admin -c en
+# Verify database
+sudo -u "$DSPACE_USER" "$DSPACE_DIR/bin/dspace" database info
 
-echo "=== Setting up frontend ==="
-FRONTEND_DIR="/opt/dspace-angular"
-if [ ! -d "$FRONTEND_DIR" ]; then
-    cd /opt
-    git clone https://github.com/DSpace/dspace-angular.git "$FRONTEND_DIR"
-    cd "$FRONTEND_DIR"
-    git checkout "dspace-${DSPACE_VERSION}"
-    
-    # Configure environment
-    cat > "$FRONTEND_DIR/config/local.cfg" <<EOF
-rest.host = localhost
-rest.port = 8080
-rest.nameSpace = /server
-rest.ssl = false
-ui.port = 4000
-EOF
-    
-    yarn install
-    chown -R "$DSPACE_USER":"$DSPACE_USER" "$FRONTEND_DIR"
-else
-    echo "Frontend already exists"
+echo "=== STEP 12: Installing Solr Cores ==="
+# Start Solr if not running
+if ! pgrep -f "start.jar" > /dev/null; then
+    sudo -u solr "$SOLR_DIR/bin/solr" start
 fi
 
-echo "=== Creating systemd service for backend ==="
+# Wait for Solr to start
+sleep 10
+
+# Copy DSpace Solr cores
+echo "Copying Solr cores..."
+mkdir -p "$SOLR_DIR/server/solr/configsets"
+cp -r "$DSPACE_DIR/solr/"* "$SOLR_DIR/server/solr/configsets/"
+chown -R solr:solr "$SOLR_DIR/server/solr/configsets"
+
+# Restart Solr to pick up new cores
+sudo -u solr "$SOLR_DIR/bin/solr" restart
+
+# Give Solr time to initialize cores
+sleep 15
+
+echo "=== STEP 13: Creating DSpace Administrator Account ==="
+echo "Creating admin user..."
+echo -e "admin@localhost\nAdmin\nUser\nadmin\nadmin" | sudo -u "$DSPACE_USER" "$DSPACE_DIR/bin/dspace" create-administrator
+
+echo "=== STEP 14: Starting DSpace Backend ==="
+
+# Create systemd service for backend
 cat > /etc/systemd/system/dspace-backend.service <<EOF
 [Unit]
 Description=DSpace Backend (REST API)
 After=postgresql.service network.target
 
 [Service]
-Type=forking
+Type=simple
 User=$DSPACE_USER
 Group=$DSPACE_USER
 Environment="JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64"
 Environment="PATH=/usr/lib/jvm/java-17-openjdk-amd64/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-WorkingDirectory=$DSPACE_DIR
-ExecStart=/bin/bash -c '$DSPACE_DIR/bin/dspace start'
-ExecStop=/bin/bash -c '$DSPACE_DIR/bin/dspace stop'
-PIDFile=$DSPACE_DIR/dspace.pid
+WorkingDirectory=$DSPACE_DIR/webapps
+ExecStart=/usr/bin/java -jar $DSPACE_DIR/webapps/server-boot.jar --dspace.dir=$DSPACE_DIR
 Restart=on-failure
 RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-echo "=== Creating systemd service for frontend ==="
-cat > /etc/systemd/system/dspace-frontend.service <<EOF
-[Unit]
-Description=DSpace Frontend (Angular UI)
-After=network.target dspace-backend.service
-
-[Service]
-Type=simple
-User=$DSPACE_USER
-Group=$DSPACE_USER
-WorkingDirectory=$FRONTEND_DIR
-ExecStart=/usr/bin/yarn run start:prod
-Restart=on-failure
-RestartSec=10
-Environment=NODE_ENV=production
-Environment=PATH=/usr/bin:/usr/local/bin
 StandardOutput=journal
 StandardError=journal
 
@@ -216,19 +259,14 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-echo "=== Enabling and starting services ==="
 systemctl daemon-reload
 systemctl enable dspace-backend
-systemctl enable dspace-frontend
-
-echo "Starting backend service..."
 systemctl start dspace-backend
 
-# Wait for backend to fully start
-echo "Waiting for backend to initialize (this may take 2-3 minutes)..."
+echo "Waiting for backend to start (may take 2-3 minutes)..."
 for i in {1..60}; do
     if curl -s http://localhost:8080/server/api > /dev/null 2>&1; then
-        echo "Backend is up!"
+        echo "Backend is running!"
         break
     fi
     echo -n "."
@@ -236,47 +274,200 @@ for i in {1..60}; do
 done
 echo ""
 
-echo "Starting frontend service..."
-systemctl start dspace-frontend
+# ==========================================
+# FRONTEND INSTALLATION
+# ==========================================
 
-# Give frontend time to start
+echo ""
+echo "=== STEP 15: Installing Frontend Prerequisites ==="
+
+# Install Node.js 20.x (LTS)
+echo "Installing Node.js..."
+curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+apt-get install -y nodejs
+
+echo "Node version:"
+node --version
+npm --version
+
+# Install PM2 globally
+npm install -g pm2 yarn
+
+echo "=== STEP 16: Downloading DSpace Frontend Source Code ==="
+cd /opt
+
+if [ ! -d "$DSPACE_UI/.git" ]; then
+    echo "Cloning DSpace Angular repository..."
+    git clone https://github.com/DSpace/dspace-angular.git "$DSPACE_UI"
+    cd "$DSPACE_UI"
+    git checkout "dspace-${DSPACE_VERSION}"
+else
+    echo "DSpace Angular already exists at $DSPACE_UI"
+    cd "$DSPACE_UI"
+fi
+
+echo "=== STEP 17: Installing Frontend Dependencies ==="
+cd "$DSPACE_UI"
+npm install
+
+echo "=== STEP 18: Configuring Frontend ==="
+# Create production config
+cat > "$DSPACE_UI/config/config.prod.yml" <<EOF
+# User Interface (UI) Configuration
+ui:
+  ssl: false
+  host: localhost
+  port: 4000
+  nameSpace: /
+
+# REST API Configuration
+rest:
+  ssl: false
+  host: localhost
+  port: 8080
+  nameSpace: /server
+EOF
+
+echo "=== STEP 19: Building Frontend ==="
+echo "This may take 10-15 minutes..."
+npm run build:prod
+
+echo "=== STEP 20: Setting Up Frontend for Production ==="
+# Change ownership
+chown -R "$DSPACE_USER":"$DSPACE_USER" "$DSPACE_UI"
+
+# Create PM2 configuration
+cat > "$DSPACE_UI/dspace-ui.json" <<EOF
+{
+  "apps": [
+    {
+      "name": "dspace-ui",
+      "cwd": "$DSPACE_UI",
+      "script": "dist/server/main.js",
+      "instances": "max",
+      "exec_mode": "cluster",
+      "env": {
+        "NODE_ENV": "production"
+      }
+    }
+  ]
+}
+EOF
+
+chown "$DSPACE_USER":"$DSPACE_USER" "$DSPACE_UI/dspace-ui.json"
+
+# Create systemd service for frontend
+cat > /etc/systemd/system/dspace-frontend.service <<EOF
+[Unit]
+Description=DSpace Frontend (Angular UI)
+After=network.target dspace-backend.service
+
+[Service]
+Type=forking
+User=$DSPACE_USER
+Group=$DSPACE_USER
+WorkingDirectory=$DSPACE_UI
+ExecStart=/usr/bin/pm2 start $DSPACE_UI/dspace-ui.json
+ExecStop=/usr/bin/pm2 stop dspace-ui
+ExecReload=/usr/bin/pm2 reload dspace-ui
+Restart=on-failure
+RestartSec=10
+Environment=NODE_ENV=production
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable dspace-frontend
+
+echo "=== STEP 21: Starting Frontend ==="
+# Start PM2 as dspace user
+sudo -u "$DSPACE_USER" pm2 start "$DSPACE_UI/dspace-ui.json"
+
+# Save PM2 process list
+sudo -u "$DSPACE_USER" pm2 save
+
+# Setup PM2 startup script
+pm2 startup systemd -u "$DSPACE_USER" --hp /home/"$DSPACE_USER"
+
 sleep 10
 
-echo "=== Checking service status ==="
-systemctl status dspace-backend --no-pager || true
-systemctl status dspace-frontend --no-pager || true
+# ==========================================
+# VERIFICATION & COMPLETION
+# ==========================================
 
 echo ""
-echo "=== Installation complete! ==="
+echo "=== Installation Verification ==="
 echo ""
-echo "Configuration details:"
-echo "  DSpace directory: $DSPACE_DIR"
-echo "  Source directory: $DSPACE_SRC"
-echo "  Frontend directory: $FRONTEND_DIR"
-echo "  Database: $DB_NAME"
-echo "  DB User: $DB_USER"
-echo "  DB Password: $DB_PASS"
+
+echo "Backend status:"
+systemctl status dspace-backend --no-pager || true
 echo ""
-echo "Access URLs:"
-echo "  Backend API: http://localhost:8080/server"
-echo "  Frontend UI: http://localhost:4000"
+
+echo "Frontend status:"
+sudo -u "$DSPACE_USER" pm2 status
 echo ""
-echo "Admin credentials:"
-echo "  Email: admin@yourdomain.edu"
-echo "  Password: admin"
+
+echo "Checking backend accessibility..."
+curl -s http://localhost:8080/server/api | head -n 5 || echo "Backend not responding yet"
 echo ""
-echo "Service management:"
-echo "  Backend:  sudo systemctl {start|stop|restart|status} dspace-backend"
-echo "  Frontend: sudo systemctl {start|stop|restart|status} dspace-frontend"
-echo "  View logs: sudo journalctl -u dspace-backend -f"
-echo "             sudo journalctl -u dspace-frontend -f"
+
+echo "Checking frontend accessibility..."
+curl -s http://localhost:4000 | head -n 5 || echo "Frontend not responding yet"
 echo ""
-echo "Both services are enabled and will start automatically on boot!"
+
+echo "=== Installation Complete! ==="
 echo ""
-echo "⚠️  IMPORTANT: Change the admin password and database password!"
-echo "⚠️  Configure proper email settings in local.cfg for production"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  DSPACE ${DSPACE_VERSION} INSTALLATION SUMMARY"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
-echo "If services aren't running, check logs with:"
-echo "  sudo journalctl -u dspace-backend -n 50"
-echo "  sudo journalctl -u dspace-frontend -n 50"
+echo "📂 Installation Directories:"
+echo "   Backend:  $DSPACE_DIR"
+echo "   Source:   $DSPACE_SRC"
+echo "   Frontend: $DSPACE_UI"
+echo "   Solr:     $SOLR_DIR"
+echo ""
+echo "🗄️  Database:"
+echo "   Database:  $DB_NAME"
+echo "   User:      $DB_USER"
+echo "   Password:  $DB_PASS"
+echo ""
+echo "🌐 Access URLs:"
+echo "   Frontend UI:  http://localhost:4000"
+echo "   Backend API:  http://localhost:8080/server"
+echo "   Solr Admin:   http://localhost:8983/solr"
+echo ""
+echo "👤 Admin Account:"
+echo "   Email:    admin@localhost"
+echo "   Password: admin"
+echo ""
+echo "🔧 Service Management:"
+echo "   Backend:"
+echo "     sudo systemctl {start|stop|restart|status} dspace-backend"
+echo "     sudo journalctl -u dspace-backend -f"
+echo ""
+echo "   Frontend:"
+echo "     sudo -u $DSPACE_USER pm2 {start|stop|restart|status|logs} dspace-ui"
+echo "     sudo journalctl -u dspace-frontend -f"
+echo ""
+echo "   Solr:"
+echo "     sudo -u solr $SOLR_DIR/bin/solr {start|stop|restart|status}"
+echo ""
+echo "🔒 Security Reminders:"
+echo "   ⚠️  CHANGE the database password in $DSPACE_SRC/local.cfg"
+echo "   ⚠️  CHANGE the admin password via the UI"
+echo "   ⚠️  UPDATE handle.prefix in local.cfg (get one from handle.net)"
+echo "   ⚠️  CONFIGURE email settings in local.cfg"
+echo "   ⚠️  ENABLE HTTPS for production (required for login to work!)"
+echo ""
+echo "📚 Documentation:"
+echo "   https://wiki.lyrasis.org/display/DSDOC9x"
+echo ""
+echo "✅ Both services will auto-start on system boot!"
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
