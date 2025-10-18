@@ -174,15 +174,20 @@ echo "=== Creating systemd service for backend ==="
 cat > /etc/systemd/system/dspace-backend.service <<EOF
 [Unit]
 Description=DSpace Backend (REST API)
-After=postgresql.service
+After=postgresql.service network.target
 
 [Service]
-Type=simple
+Type=forking
 User=$DSPACE_USER
+Group=$DSPACE_USER
+Environment="JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64"
+Environment="PATH=/usr/lib/jvm/java-17-openjdk-amd64/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 WorkingDirectory=$DSPACE_DIR
-ExecStart=$DSPACE_DIR/bin/dspace start
-ExecStop=$DSPACE_DIR/bin/dspace stop
+ExecStart=/bin/bash -c '$DSPACE_DIR/bin/dspace start'
+ExecStop=/bin/bash -c '$DSPACE_DIR/bin/dspace stop'
+PIDFile=$DSPACE_DIR/dspace.pid
 Restart=on-failure
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
@@ -192,15 +197,20 @@ echo "=== Creating systemd service for frontend ==="
 cat > /etc/systemd/system/dspace-frontend.service <<EOF
 [Unit]
 Description=DSpace Frontend (Angular UI)
-After=dspace-backend.service
+After=network.target dspace-backend.service
 
 [Service]
 Type=simple
 User=$DSPACE_USER
+Group=$DSPACE_USER
 WorkingDirectory=$FRONTEND_DIR
-ExecStart=/usr/bin/yarn start:prod
+ExecStart=/usr/bin/yarn run start:prod
 Restart=on-failure
+RestartSec=10
 Environment=NODE_ENV=production
+Environment=PATH=/usr/bin:/usr/local/bin
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
@@ -210,13 +220,31 @@ echo "=== Enabling and starting services ==="
 systemctl daemon-reload
 systemctl enable dspace-backend
 systemctl enable dspace-frontend
+
+echo "Starting backend service..."
 systemctl start dspace-backend
 
-# Wait for backend to start
-echo "Waiting for backend to start..."
-sleep 30
+# Wait for backend to fully start
+echo "Waiting for backend to initialize (this may take 2-3 minutes)..."
+for i in {1..60}; do
+    if curl -s http://localhost:8080/server/api > /dev/null 2>&1; then
+        echo "Backend is up!"
+        break
+    fi
+    echo -n "."
+    sleep 3
+done
+echo ""
 
+echo "Starting frontend service..."
 systemctl start dspace-frontend
+
+# Give frontend time to start
+sleep 10
+
+echo "=== Checking service status ==="
+systemctl status dspace-backend --no-pager || true
+systemctl status dspace-frontend --no-pager || true
 
 echo ""
 echo "=== Installation complete! ==="
@@ -224,6 +252,7 @@ echo ""
 echo "Configuration details:"
 echo "  DSpace directory: $DSPACE_DIR"
 echo "  Source directory: $DSPACE_SRC"
+echo "  Frontend directory: $FRONTEND_DIR"
 echo "  Database: $DB_NAME"
 echo "  DB User: $DB_USER"
 echo "  DB Password: $DB_PASS"
@@ -237,9 +266,17 @@ echo "  Email: admin@yourdomain.edu"
 echo "  Password: admin"
 echo ""
 echo "Service management:"
-echo "  Backend: sudo systemctl {start|stop|restart|status} dspace-backend"
+echo "  Backend:  sudo systemctl {start|stop|restart|status} dspace-backend"
 echo "  Frontend: sudo systemctl {start|stop|restart|status} dspace-frontend"
+echo "  View logs: sudo journalctl -u dspace-backend -f"
+echo "             sudo journalctl -u dspace-frontend -f"
+echo ""
+echo "Both services are enabled and will start automatically on boot!"
 echo ""
 echo "⚠️  IMPORTANT: Change the admin password and database password!"
 echo "⚠️  Configure proper email settings in local.cfg for production"
+echo ""
+echo "If services aren't running, check logs with:"
+echo "  sudo journalctl -u dspace-backend -n 50"
+echo "  sudo journalctl -u dspace-frontend -n 50"
 echo ""
