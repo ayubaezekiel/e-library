@@ -472,3 +472,22 @@ echo "✅ Both services will auto-start on system boot!"
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
+
+
+# Stop services
+sudo systemctl stop dspace-backend dspace-frontend
+sudo -u dspace pm2 kill
+sudo -u solr /opt/solr/bin/solr stop
+
+# Remove everything
+sudo rm -rf /dspace /opt/dspace-source /opt/dspace-angular /opt/solr
+sudo rm -f /etc/systemd/system/dspace-*.service
+sudo systemctl daemon-reload
+
+# Drop database
+sudo -u postgres psql -c "DROP DATABASE IF EXISTS dspace;"
+sudo -u postgres psql -c "DROP USER IF EXISTS dspace;"
+
+# Remove users (optional)
+sudo userdel -r dspace
+sudo userdel -r solr
