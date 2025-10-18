@@ -151,8 +151,8 @@ chown -R "$DSPACE_USER":"$DSPACE_USER" "$DSPACE_SRC"
 echo "=== STEP 7: Configuring DSpace (local.cfg) ==="
 cd "$DSPACE_SRC"
 
-# Create local.cfg based on the official example
-cat > "$DSPACE_SRC/local.cfg" <<EOF
+# Create local.cfg in the correct location: [dspace-source]/dspace/config/local.cfg
+cat > "$DSPACE_SRC/dspace/config/local.cfg" <<EOF
 # DSpace Installation Directory
 dspace.dir = $DSPACE_DIR
 
@@ -337,6 +337,7 @@ echo "=== STEP 20: Setting Up Frontend for Production ==="
 chown -R "$DSPACE_USER":"$DSPACE_USER" "$DSPACE_UI"
 
 # Create PM2 configuration
+# According to docs, PM2 must run from the directory containing the /dist folder
 cat > "$DSPACE_UI/dspace-ui.json" <<EOF
 {
   "apps": [
