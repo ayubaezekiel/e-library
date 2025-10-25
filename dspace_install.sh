@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # DSpace Docker Installation and Setup Script with Auto-Install
-# This script automates Docker installation and DSpace setup
+# This script automates Docker installation and DSpace setup for Ubuntu
 
 set -e  # Exit on any error
 
@@ -34,7 +34,7 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-# Function to install Docker on Ubuntu/Debian
+# Function to install Docker on Ubuntu
 install_docker_ubuntu() {
     print_step "Installing Docker on Ubuntu..."
     
