@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# DSpace Docker Installation and Setup Script
-# This script automates the installation of DSpace via Docker
+# DSpace Docker Installation and Setup Script with Auto-Install
+# This script automates Docker installation and DSpace setup
 
 set -e  # Exit on any error
 
@@ -9,6 +9,7 @@ set -e  # Exit on any error
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Function to print colored messages
@@ -24,26 +25,241 @@ print_warning() {
     echo -e "${YELLOW}[WARNING]${NC} $1"
 }
 
+print_step() {
+    echo -e "${BLUE}[STEP]${NC} $1"
+}
+
 # Function to check if a command exists
 command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+# Function to detect OS
+detect_os() {
+    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        if [ -f /etc/os-release ]; then
+            . /etc/os-release
+            OS=$ID
+            VER=$VERSION_ID
+        else
+            OS="unknown"
+        fi
+    elif [[ "$OSTYPE" == "darwin"* ]]; then
+        OS="macos"
+    elif [[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "cygwin" ]] || [[ "$OSTYPE" == "win32" ]]; then
+        OS="windows"
+    else
+        OS="unknown"
+    fi
+    echo "$OS"
+}
+
+# Function to install Docker on Ubuntu/Debian
+install_docker_ubuntu() {
+    print_step "Installing Docker on Ubuntu/Debian..."
+    
+    # Update package index
+    sudo apt-get update
+    
+    # Install prerequisites
+    sudo apt-get install -y \
+        ca-certificates \
+        curl \
+        gnupg \
+        lsb-release
+    
+    # Add Docker's official GPG key
+    sudo mkdir -p /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/$1/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    
+    # Set up the repository
+    echo \
+      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$1 \
+      $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+    
+    # Install Docker Engine
+    sudo apt-get update
+    sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    
+    # Start and enable Docker
+    sudo systemctl start docker
+    sudo systemctl enable docker
+    
+    # Add current user to docker group
+    sudo usermod -aG docker $USER
+    
+    print_message "Docker installed successfully!"
+    print_warning "You may need to log out and back in for group changes to take effect."
+    print_warning "Or run: newgrp docker"
+}
+
+# Function to install Docker on CentOS/RHEL/Fedora
+install_docker_rhel() {
+    print_step "Installing Docker on CentOS/RHEL/Fedora..."
+    
+    # Remove old versions
+    sudo yum remove -y docker docker-client docker-client-latest docker-common docker-latest docker-latest-logrotate docker-logrotate docker-engine
+    
+    # Install prerequisites
+    sudo yum install -y yum-utils
+    
+    # Add Docker repository
+    sudo yum-config-manager --add-repo https://download.docker.com/linux/$1/docker-ce.repo
+    
+    # Install Docker
+    sudo yum install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    
+    # Start and enable Docker
+    sudo systemctl start docker
+    sudo systemctl enable docker
+    
+    # Add current user to docker group
+    sudo usermod -aG docker $USER
+    
+    print_message "Docker installed successfully!"
+    print_warning "You may need to log out and back in for group changes to take effect."
+}
+
+# Function to install Docker on macOS
+install_docker_macos() {
+    print_step "Installing Docker Desktop on macOS..."
+    
+    if ! command_exists brew; then
+        print_error "Homebrew is not installed. Installing Homebrew first..."
+        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    fi
+    
+    print_message "Installing Docker Desktop via Homebrew..."
+    brew install --cask docker
+    
+    print_message "Docker Desktop installed successfully!"
+    print_warning "Please open Docker Desktop from Applications to complete setup."
+    print_warning "Waiting 30 seconds for Docker to start..."
+    sleep 30
+}
+
+# Function to install Git
+install_git() {
+    local os=$(detect_os)
+    
+    print_step "Installing Git..."
+    
+    case $os in
+        ubuntu|debian)
+            sudo apt-get update
+            sudo apt-get install -y git
+            ;;
+        centos|rhel|fedora)
+            sudo yum install -y git
+            ;;
+        macos)
+            if command_exists brew; then
+                brew install git
+            else
+                print_error "Please install Homebrew first or download Git from https://git-scm.com/downloads"
+                exit 1
+            fi
+            ;;
+        *)
+            print_error "Automatic Git installation not supported for this OS."
+            echo "Please install Git from: https://git-scm.com/downloads"
+            exit 1
+            ;;
+    esac
+    
+    print_message "Git installed successfully!"
+}
+
+# Main installation function
+install_docker() {
+    local os=$(detect_os)
+    
+    print_message "Detected OS: $os"
+    
+    case $os in
+        ubuntu|debian)
+            install_docker_ubuntu "ubuntu"
+            ;;
+        centos|rhel)
+            install_docker_rhel "centos"
+            ;;
+        fedora)
+            install_docker_rhel "fedora"
+            ;;
+        macos)
+            install_docker_macos
+            ;;
+        windows)
+            print_error "Automatic Docker installation on Windows is not supported via this script."
+            echo "Please download and install Docker Desktop manually:"
+            echo "https://docs.docker.com/desktop/install/windows-install/"
+            exit 1
+            ;;
+        *)
+            print_error "Unsupported operating system: $os"
+            echo "Please install Docker manually from: https://docs.docker.com/get-docker/"
+            exit 1
+            ;;
+    esac
+}
+
 # Check prerequisites
 print_message "Checking prerequisites..."
 
+# Check and install Docker
 if ! command_exists docker; then
-    print_error "Docker is not installed. Please install Docker Desktop first."
-    echo "Windows: https://docs.docker.com/desktop/install/windows-install/"
-    echo "Mac: https://docs.docker.com/desktop/install/mac-install/"
-    echo "Linux: https://docs.docker.com/engine/install/"
-    exit 1
+    print_warning "Docker is not installed."
+    read -p "Would you like to install Docker automatically? (Y/n): " install_docker_choice
+    
+    if [[ ! $install_docker_choice =~ ^[Nn]$ ]]; then
+        install_docker
+        
+        # Verify installation
+        if ! command_exists docker; then
+            print_error "Docker installation failed or requires system restart."
+            exit 1
+        fi
+    else
+        print_error "Docker is required to continue. Please install it manually."
+        echo "Visit: https://docs.docker.com/get-docker/"
+        exit 1
+    fi
+else
+    print_message "Docker is already installed."
 fi
 
+# Check Docker service status
+if ! docker ps >/dev/null 2>&1; then
+    print_warning "Docker daemon is not running or requires elevated privileges."
+    
+    # Try to start Docker on Linux
+    if [[ "$(detect_os)" =~ ^(ubuntu|debian|centos|rhel|fedora)$ ]]; then
+        print_message "Attempting to start Docker service..."
+        sudo systemctl start docker
+        sleep 5
+    fi
+    
+    # Check again
+    if ! docker ps >/dev/null 2>&1; then
+        print_error "Cannot connect to Docker daemon. Please ensure Docker is running."
+        exit 1
+    fi
+fi
+
+# Check and install Git
 if ! command_exists git; then
-    print_error "Git is not installed. Please install Git first."
-    echo "Download from: https://git-scm.com/downloads"
-    exit 1
+    print_warning "Git is not installed."
+    read -p "Would you like to install Git automatically? (Y/n): " install_git_choice
+    
+    if [[ ! $install_git_choice =~ ^[Nn]$ ]]; then
+        install_git
+    else
+        print_error "Git is required to continue. Please install it manually."
+        echo "Download from: https://git-scm.com/downloads"
+        exit 1
+    fi
+else
+    print_message "Git is already installed."
 fi
 
 print_message "Prerequisites check passed!"
