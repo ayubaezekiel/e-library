@@ -172,11 +172,43 @@ if [[ $rebuild_ui =~ ^[Yy]$ ]]; then
 fi
 
 # Start DSpace services
-print_message "Starting DSpace services (REST API and Angular UI)..."
+print_message "Starting DSpace services (Database, REST API and Angular UI)..."
 docker compose -p d9 -f docker/docker-compose.yml -f docker/docker-compose-rest.yml up -d
 
-print_message "Waiting for services to start (30 seconds)..."
-sleep 30
+print_message "Waiting for database to initialize (60 seconds)..."
+sleep 60
+
+# Check if database is ready
+print_message "Verifying database connection..."
+max_attempts=10
+attempt=0
+while [ $attempt -lt $max_attempts ]; do
+    if docker compose -p d9 -f docker/docker-compose.yml exec -T dspacedb pg_isready -U dspace > /dev/null 2>&1; then
+        print_message "Database is ready!"
+        break
+    fi
+    attempt=$((attempt + 1))
+    if [ $attempt -eq $max_attempts ]; then
+        print_error "Database failed to start. Please check logs."
+        docker compose -p d9 -f docker/docker-compose.yml -f docker/docker-compose-rest.yml logs dspacedb
+        exit 1
+    fi
+    print_warning "Waiting for database... (attempt $attempt/$max_attempts)"
+    sleep 10
+done
+
+# Verify all required containers are running
+print_message "Verifying all containers are running..."
+required_containers=("dspace" "dspace-angular" "dspacesolr" "dspacedb")
+for container in "${required_containers[@]}"; do
+    if docker ps --format '{{.Names}}' | grep -q "$container"; then
+        print_message "✓ $container is running"
+    else
+        print_error "✗ $container is not running!"
+        print_error "Please check the logs: docker compose -p d9 -f docker/docker-compose.yml -f docker/docker-compose-rest.yml logs $container"
+        exit 1
+    fi
+done
 
 # Ask user about test data
 echo ""
