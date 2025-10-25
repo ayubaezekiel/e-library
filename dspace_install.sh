@@ -34,29 +34,9 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-# Function to detect OS
-detect_os() {
-    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-        if [ -f /etc/os-release ]; then
-            . /etc/os-release
-            OS=$ID
-            VER=$VERSION_ID
-        else
-            OS="unknown"
-        fi
-    elif [[ "$OSTYPE" == "darwin"* ]]; then
-        OS="macos"
-    elif [[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "cygwin" ]] || [[ "$OSTYPE" == "win32" ]]; then
-        OS="windows"
-    else
-        OS="unknown"
-    fi
-    echo "$OS"
-}
-
 # Function to install Docker on Ubuntu/Debian
 install_docker_ubuntu() {
-    print_step "Installing Docker on Ubuntu/Debian..."
+    print_step "Installing Docker on Ubuntu..."
     
     # Update package index
     sudo apt-get update
@@ -70,11 +50,11 @@ install_docker_ubuntu() {
     
     # Add Docker's official GPG key
     sudo mkdir -p /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/$1/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
     
     # Set up the repository
     echo \
-      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$1 \
+      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
       $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
     
     # Install Docker Engine
@@ -93,114 +73,20 @@ install_docker_ubuntu() {
     print_warning "Or run: newgrp docker"
 }
 
-# Function to install Docker on CentOS/RHEL/Fedora
-install_docker_rhel() {
-    print_step "Installing Docker on CentOS/RHEL/Fedora..."
-    
-    # Remove old versions
-    sudo yum remove -y docker docker-client docker-client-latest docker-common docker-latest docker-latest-logrotate docker-logrotate docker-engine
-    
-    # Install prerequisites
-    sudo yum install -y yum-utils
-    
-    # Add Docker repository
-    sudo yum-config-manager --add-repo https://download.docker.com/linux/$1/docker-ce.repo
-    
-    # Install Docker
-    sudo yum install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-    
-    # Start and enable Docker
-    sudo systemctl start docker
-    sudo systemctl enable docker
-    
-    # Add current user to docker group
-    sudo usermod -aG docker $USER
-    
-    print_message "Docker installed successfully!"
-    print_warning "You may need to log out and back in for group changes to take effect."
-}
-
-# Function to install Docker on macOS
-install_docker_macos() {
-    print_step "Installing Docker Desktop on macOS..."
-    
-    if ! command_exists brew; then
-        print_error "Homebrew is not installed. Installing Homebrew first..."
-        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-    fi
-    
-    print_message "Installing Docker Desktop via Homebrew..."
-    brew install --cask docker
-    
-    print_message "Docker Desktop installed successfully!"
-    print_warning "Please open Docker Desktop from Applications to complete setup."
-    print_warning "Waiting 30 seconds for Docker to start..."
-    sleep 30
-}
-
 # Function to install Git
 install_git() {
-    local os=$(detect_os)
-    
     print_step "Installing Git..."
     
-    case $os in
-        ubuntu|debian)
-            sudo apt-get update
-            sudo apt-get install -y git
-            ;;
-        centos|rhel|fedora)
-            sudo yum install -y git
-            ;;
-        macos)
-            if command_exists brew; then
-                brew install git
-            else
-                print_error "Please install Homebrew first or download Git from https://git-scm.com/downloads"
-                exit 1
-            fi
-            ;;
-        *)
-            print_error "Automatic Git installation not supported for this OS."
-            echo "Please install Git from: https://git-scm.com/downloads"
-            exit 1
-            ;;
-    esac
+    sudo apt-get update
+    sudo apt-get install -y git
     
     print_message "Git installed successfully!"
 }
 
 # Main installation function
 install_docker() {
-    local os=$(detect_os)
-    
-    print_message "Detected OS: $os"
-    
-    case $os in
-        ubuntu|debian)
-            install_docker_ubuntu "ubuntu"
-            ;;
-        centos|rhel)
-            install_docker_rhel "centos"
-            ;;
-        fedora)
-            install_docker_rhel "fedora"
-            ;;
-        macos)
-            install_docker_macos
-            ;;
-        windows)
-            print_error "Automatic Docker installation on Windows is not supported via this script."
-            echo "Please download and install Docker Desktop manually:"
-            echo "https://docs.docker.com/desktop/install/windows-install/"
-            exit 1
-            ;;
-        *)
-            print_error "Unsupported operating system: $os"
-            echo "Please install Docker manually from: https://docs.docker.com/get-docker/"
-            exit 1
-            ;;
-    esac
+    print_message "Installing Docker for Ubuntu..."
+    install_docker_ubuntu
 }
 
 # Check prerequisites
@@ -231,13 +117,9 @@ fi
 # Check Docker service status
 if ! docker ps >/dev/null 2>&1; then
     print_warning "Docker daemon is not running or requires elevated privileges."
-    
-    # Try to start Docker on Linux
-    if [[ "$(detect_os)" =~ ^(ubuntu|debian|centos|rhel|fedora)$ ]]; then
-        print_message "Attempting to start Docker service..."
-        sudo systemctl start docker
-        sleep 5
-    fi
+    print_message "Attempting to start Docker service..."
+    sudo systemctl start docker
+    sleep 5
     
     # Check again
     if ! docker ps >/dev/null 2>&1; then
