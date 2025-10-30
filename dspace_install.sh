@@ -12,6 +12,9 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# Cleanup flag
+CLEANUP_ON_EXIT=false
+
 # Function to print colored messages
 print_message() {
     echo -e "${GREEN}[INFO]${NC} $1"
@@ -29,9 +32,39 @@ print_step() {
     echo -e "${BLUE}[STEP]${NC} $1"
 }
 
+# Cleanup function
+cleanup_on_failure() {
+    if [ "$CLEANUP_ON_EXIT" = true ]; then
+        print_warning "Cleaning up due to failure..."
+        cd "$(dirname "$0")"
+        if [ -d "dspace-angular" ]; then
+            cd dspace-angular
+            docker compose -p d9 -f docker/docker-compose.yml -f docker/docker-compose-rest.yml down 2>/dev/null || true
+        fi
+    fi
+}
+
+# Set trap for cleanup
+trap cleanup_on_failure EXIT
+
 # Function to check if a command exists
 command_exists() {
     command -v "$1" >/dev/null 2>&1
+}
+
+# Function to check OS
+check_os() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        if [[ "$ID" != "ubuntu" && "$ID_LIKE" != *"ubuntu"* && "$ID_LIKE" != *"debian"* ]]; then
+            print_error "This script only supports Ubuntu/Debian-based systems."
+            print_error "Detected OS: $ID"
+            exit 1
+        fi
+    else
+        print_error "Cannot determine OS. This script requires Ubuntu/Debian."
+        exit 1
+    fi
 }
 
 # Function to install Docker on Ubuntu
@@ -69,8 +102,10 @@ install_docker_ubuntu() {
     sudo usermod -aG docker $USER
     
     print_message "Docker installed successfully!"
-    print_warning "You may need to log out and back in for group changes to take effect."
-    print_warning "Or run: newgrp docker"
+    print_warning "Docker group membership added. Restarting script with proper permissions..."
+    
+    # Re-execute script with new group permissions
+    exec sg docker "$0 $@"
 }
 
 # Function to install Git
@@ -83,11 +118,80 @@ install_git() {
     print_message "Git installed successfully!"
 }
 
+# Function to validate email
+validate_email() {
+    local email=$1
+    if [[ $email =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Function to wait for container to be ready
+wait_for_container() {
+    local container_name=$1
+    local max_wait=60
+    local elapsed=0
+    
+    print_message "Waiting for container '$container_name' to be ready..."
+    
+    while [ $elapsed -lt $max_wait ]; do
+        if docker ps --format '{{.Names}}' | grep -q "^${container_name}$"; then
+            sleep 2  # Give it a moment to fully initialize
+            return 0
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+    
+    print_error "Container '$container_name' failed to start within ${max_wait} seconds"
+    return 1
+}
+
+# Function to wait for database
+wait_for_database() {
+    print_message "Waiting for database to be ready..."
+    local max_attempts=30
+    local attempt=0
+    
+    while [ $attempt -lt $max_attempts ]; do
+        # First check if container is running
+        if ! docker ps --format '{{.Names}}' | grep -q "^dspacedb$"; then
+            print_warning "Database container not running yet... (attempt $((attempt + 1))/$max_attempts)"
+            sleep 5
+            attempt=$((attempt + 1))
+            continue
+        fi
+        
+        # Then check if PostgreSQL is ready
+        if docker compose -p d9 -f docker/docker-compose.yml exec -T dspacedb pg_isready -U dspace >/dev/null 2>&1; then
+            print_message "Database is ready!"
+            return 0
+        fi
+        
+        attempt=$((attempt + 1))
+        if [ $attempt -eq $max_attempts ]; then
+            print_error "Database failed to start. Please check logs."
+            docker compose -p d9 -f docker/docker-compose.yml -f docker/docker-compose-rest.yml logs dspacedb
+            return 1
+        fi
+        print_warning "Waiting for database... (attempt $attempt/$max_attempts)"
+        sleep 5
+    done
+    
+    return 1
+}
+
 # Main installation function
 install_docker() {
     print_message "Installing Docker for Ubuntu..."
     install_docker_ubuntu
 }
+
+# Check OS compatibility
+print_message "Checking OS compatibility..."
+check_os
 
 # Check prerequisites
 print_message "Checking prerequisites..."
@@ -123,8 +227,9 @@ if ! docker ps >/dev/null 2>&1; then
     
     # Check again
     if ! docker ps >/dev/null 2>&1; then
-        print_error "Cannot connect to Docker daemon. Please ensure Docker is running."
-        exit 1
+        print_error "Cannot connect to Docker daemon. You may need to be in the docker group."
+        print_message "Attempting to run with docker group permissions..."
+        exec sg docker "$0 $@"
     fi
 fi
 
@@ -146,18 +251,42 @@ fi
 
 print_message "Prerequisites check passed!"
 
+# Enable cleanup on failure from this point
+CLEANUP_ON_EXIT=true
+
 # Clone DSpace Angular repository
 print_message "Cloning DSpace Angular repository..."
 if [ -d "dspace-angular" ]; then
-    print_warning "dspace-angular directory already exists. Skipping clone."
+    print_warning "dspace-angular directory already exists."
     cd dspace-angular
+    
+    # Check if directory is a git repository
+    if [ -d ".git" ]; then
+        print_message "Fetching latest changes..."
+        git fetch origin
+        
+        # Handle dirty working directory
+        if ! git diff-index --quiet HEAD -- 2>/dev/null; then
+            print_warning "Local changes detected. Stashing changes..."
+            git stash
+        fi
+        
+        git checkout main
+        git pull origin main
+    else
+        print_error "dspace-angular exists but is not a git repository."
+        exit 1
+    fi
 else
-    git clone https://github.com/DSpace/dspace-angular.git
+    if ! git clone https://github.com/DSpace/dspace-angular.git; then
+        print_error "Failed to clone repository."
+        exit 1
+    fi
     cd dspace-angular
 fi
 
 # Switch to main branch
-print_message "Switching to main branch..."
+print_message "Ensuring we're on main branch..."
 git checkout main
 
 # Pull latest Docker images
@@ -175,40 +304,35 @@ fi
 print_message "Starting DSpace services (Database, REST API and Angular UI)..."
 docker compose -p d9 -f docker/docker-compose.yml -f docker/docker-compose-rest.yml up -d
 
-print_message "Waiting for database to initialize (60 seconds)..."
-sleep 60
+# Wait for database container to start
+if ! wait_for_container "dspacedb"; then
+    print_error "Database container failed to start."
+    exit 1
+fi
 
-# Check if database is ready
-print_message "Verifying database connection..."
-max_attempts=10
-attempt=0
-while [ $attempt -lt $max_attempts ]; do
-    if docker compose -p d9 -f docker/docker-compose.yml exec -T dspacedb pg_isready -U dspace > /dev/null 2>&1; then
-        print_message "Database is ready!"
-        break
-    fi
-    attempt=$((attempt + 1))
-    if [ $attempt -eq $max_attempts ]; then
-        print_error "Database failed to start. Please check logs."
-        docker compose -p d9 -f docker/docker-compose.yml -f docker/docker-compose-rest.yml logs dspacedb
-        exit 1
-    fi
-    print_warning "Waiting for database... (attempt $attempt/$max_attempts)"
-    sleep 10
-done
+# Wait for database to be ready
+if ! wait_for_database; then
+    exit 1
+fi
 
 # Verify all required containers are running
 print_message "Verifying all containers are running..."
 required_containers=("dspace" "dspace-angular" "dspacesolr" "dspacedb")
+all_running=true
+
 for container in "${required_containers[@]}"; do
-    if docker ps --format '{{.Names}}' | grep -q "$container"; then
+    if docker ps --format '{{.Names}}' | grep -q "^${container}$"; then
         print_message "✓ $container is running"
     else
         print_error "✗ $container is not running!"
         print_error "Please check the logs: docker compose -p d9 -f docker/docker-compose.yml -f docker/docker-compose-rest.yml logs $container"
-        exit 1
+        all_running=false
     fi
 done
+
+if [ "$all_running" = false ]; then
+    exit 1
+fi
 
 # Ask user about test data
 echo ""
@@ -230,14 +354,25 @@ case $data_choice in
         print_message "Shutting down containers to load Entities test data..."
         docker compose -p d9 -f docker/docker-compose.yml -f docker/docker-compose-rest.yml down
         
-        print_warning "Removing existing volumes..."
-        docker volume rm $(docker volume ls -q --filter name=d9) 2>/dev/null || true
+        # Remove volumes if they exist
+        volumes=$(docker volume ls -q --filter name=d9)
+        if [ -n "$volumes" ]; then
+            print_warning "Removing existing volumes..."
+            echo "$volumes" | xargs docker volume rm
+        fi
         
         print_message "Starting containers with Entities test data..."
         docker compose -p d9 -f docker/docker-compose.yml -f docker/docker-compose-rest.yml -f docker/db.entities.yml up -d
         
-        print_message "Waiting for database to initialize (60 seconds)..."
-        sleep 60
+        # Wait for database again
+        if ! wait_for_container "dspacedb"; then
+            print_error "Database container failed to start."
+            exit 1
+        fi
+        
+        if ! wait_for_database; then
+            exit 1
+        fi
         
         print_message "Loading Entities test assetstore and reindexing..."
         docker compose -p d9 -f docker/cli.yml -f docker/cli.assetstore.yml run --rm dspace-cli
@@ -254,16 +389,33 @@ esac
 if [ "$data_choice" != "1" ]; then
     read -p "Create administrator account? (Y/n): " create_admin
     if [[ ! $create_admin =~ ^[Nn]$ ]]; then
-        read -p "Enter admin email (default: test@test.edu): " admin_email
-        admin_email=${admin_email:-test@test.edu}
+        admin_email=""
+        while true; do
+            read -p "Enter admin email (default: test@test.edu): " admin_email
+            admin_email=${admin_email:-test@test.edu}
+            
+            if validate_email "$admin_email"; then
+                break
+            else
+                print_error "Invalid email format. Please try again."
+            fi
+        done
         
         read -p "Enter admin password (default: admin): " admin_password
         admin_password=${admin_password:-admin}
+        
+        if [ ${#admin_password} -lt 4 ]; then
+            print_warning "Password is short. Consider using a stronger password."
+        fi
         
         print_message "Creating administrator account..."
         docker compose -p d9 -f docker/cli.yml run --rm dspace-cli create-administrator -e "$admin_email" -f admin -l user -p "$admin_password" -c en
     fi
 fi
+
+# Disable cleanup trap on success
+CLEANUP_ON_EXIT=false
+trap - EXIT
 
 # Display completion message
 echo ""
@@ -278,10 +430,10 @@ echo ""
 
 if [ "$data_choice" != "3" ]; then
     echo "Admin Login:"
-    if [ "$data_choice" == "1" ] || [ -z "$admin_email" ]; then
+    if [ "$data_choice" == "1" ]; then
         echo "  Email: test@test.edu"
         echo "  Password: admin"
-    else
+    elif [ -n "$admin_email" ]; then
         echo "  Email: $admin_email"
         echo "  Password: $admin_password"
     fi
